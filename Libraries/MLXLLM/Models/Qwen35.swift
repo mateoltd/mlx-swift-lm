@@ -795,6 +795,7 @@ public class Qwen35TextModelInner: Module {
 
     let ssmIdx: Int
     let faIdx: Int
+    let hiddenSize: Int
     private var pipeline: PipelineConfiguration?
 
     private struct PipelineConfiguration {
@@ -822,6 +823,7 @@ public class Qwen35TextModelInner: Module {
 
         self.ssmIdx = 0
         self.faIdx = args.fullAttentionInterval - 1
+        self.hiddenSize = args.hiddenSize
 
         let segments = Self.decodeSchedule(for: layers)
         self.decodeSegments = segments
@@ -894,11 +896,18 @@ public class Qwen35TextModelInner: Module {
         cache: [KVCache?]?,
         pipeline: PipelineConfiguration
     ) -> MLXArray {
-        var hiddenStates = embedTokens(inputs)
-        if pipeline.rank != 0 {
-            hiddenStates = pipeline.group.recvLike(
-                hiddenStates, source: Int32(pipeline.rank - 1))
-        }
+        var hiddenStates =
+            if pipeline.rank == 0 {
+                embedTokens(inputs)
+            } else {
+                pipeline.group.recvLike(
+                    MLXArray.zeros(
+                        [inputs.dim(0), inputs.dim(1), hiddenSize],
+                        dtype: embedTokens.weight.dtype
+                    ),
+                    source: Int32(pipeline.rank - 1)
+                )
+            }
 
         var cacheArray = cache
         if cacheArray == nil {

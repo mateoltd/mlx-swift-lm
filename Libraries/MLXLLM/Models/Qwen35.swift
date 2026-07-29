@@ -438,7 +438,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 
 // MARK: - Decoder Layer
 
-final class Qwen35DecoderLayer: Module {
+final class Qwen35DecoderLayer: Module, TransformerLayer {
     let isLinear: Bool
 
     @ModuleInfo(key: "self_attn") var selfAttn: Qwen35Attention?
@@ -495,6 +495,23 @@ final class Qwen35DecoderLayer: Module {
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
+        let ssmMask =
+            isLinear
+            ? createSSMMask(h: x, cache: cache as? MambaCache)
+            : nil
+        return callAsFunction(
+            x,
+            attentionMask: isLinear ? .none : mask,
+            ssmMask: ssmMask,
+            cache: cache
+        )
+    }
 }
 
 // MARK: - Text Model
@@ -502,11 +519,9 @@ final class Qwen35DecoderLayer: Module {
 public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen35DecoderLayer]
+    public var layers: [TransformerLayer]
+    public private(set) var layerIsLinear: [Bool]
     let norm: RMSNorm
-
-    let ssmIdx: Int
-    let faIdx: Int
 
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -516,14 +531,13 @@ public class Qwen35TextModelInner: Module {
             dimensions: args.hiddenSize
         )
 
-        self.layers = (0 ..< args.hiddenLayers).map { layerIdx in
+        let decoderLayers = (0 ..< args.hiddenLayers).map { layerIdx in
             Qwen35DecoderLayer(args, layerIdx: layerIdx)
         }
+        self.layers = decoderLayers
+        self.layerIsLinear = decoderLayers.map(\.isLinear)
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
-
-        self.ssmIdx = 0
-        self.faIdx = args.fullAttentionInterval - 1
 
         super.init()
     }
@@ -536,19 +550,22 @@ public class Qwen35TextModelInner: Module {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
         }
 
-        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
-        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        let firstFullAttentionIndex = layerIsLinear.firstIndex(of: false)
+        let faCache = firstFullAttentionIndex.flatMap { cacheArray?[$0] }
+        let faMask = createAttentionMask(h: hiddenStates, cache: faCache)
 
         for (i, layer) in layers.enumerated() {
-            let mask = layer.isLinear ? ssmMask : nil
-            let attnMask =
-                layer.isLinear
-                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
-            hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+            hiddenStates = layer(hiddenStates, mask: faMask, cache: cacheArray?[i])
         }
 
         return norm(hiddenStates)
+    }
+
+    public func replaceLayers(_ newLayers: [TransformerLayer], shardOffset: Int) {
+        let safeStart = max(0, min(shardOffset, layerIsLinear.count))
+        let safeEnd = min(safeStart + newLayers.count, layerIsLinear.count)
+        layers = newLayers
+        layerIsLinear = Array(layerIsLinear[safeStart ..< safeEnd])
     }
 }
 
@@ -583,9 +600,15 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        return model.layers.map { layer in
-            if layer.isLinear {
+        return model.layerIsLinear.map { isLinear in
+            if isLinear {
                 return MambaCache()
+            }
+            if let bits = parameters?.kvBits {
+                return QuantizedKVCache(
+                    groupSize: parameters?.kvGroupSize ?? 64,
+                    bits: bits
+                )
             }
             return KVCacheSimple()
         }
@@ -642,7 +665,7 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
-    @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
+    @ModuleInfo(key: "language_model") public var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
         let textModel = Qwen35TextModel(args.textConfig)

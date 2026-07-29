@@ -121,6 +121,12 @@ public struct ModelConfiguration: Sendable {
     /// Reasoning (chain-of-thought) protocol for this model (nil = non-reasoning model)
     public var reasoningConfig: ReasoningConfig? = nil
 
+    /// Whether model weights should be evaluated immediately after loading.
+    ///
+    /// Distributed runtimes can disable this so they can configure a shard
+    /// before first evaluation. Standalone callers should keep the default.
+    public var eagerlyEvaluateWeights: Bool
+
     public init(
         id: String, revision: String = "main",
         tokenizerSource: TokenizerSource? = nil,
@@ -129,7 +135,8 @@ public struct ModelConfiguration: Sendable {
         stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int> = [],
         toolCallFormat: ToolCallFormat? = nil,
-        reasoningConfig: ReasoningConfig? = nil
+        reasoningConfig: ReasoningConfig? = nil,
+        eagerlyEvaluateWeights: Bool = true
     ) {
         self.id = .id(id, revision: revision)
         self.tokenizerSource = tokenizerSource
@@ -139,6 +146,7 @@ public struct ModelConfiguration: Sendable {
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
         self.reasoningConfig = reasoningConfig
+        self.eagerlyEvaluateWeights = eagerlyEvaluateWeights
     }
 
     public init(
@@ -149,7 +157,8 @@ public struct ModelConfiguration: Sendable {
         stopStrings: Set<String>? = nil,
         eosTokenIds: Set<Int> = [],
         toolCallFormat: ToolCallFormat? = nil,
-        reasoningConfig: ReasoningConfig? = nil
+        reasoningConfig: ReasoningConfig? = nil,
+        eagerlyEvaluateWeights: Bool = true
     ) {
         self.id = .directory(directory)
         self.tokenizerSource = tokenizerSource
@@ -159,6 +168,7 @@ public struct ModelConfiguration: Sendable {
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
         self.reasoningConfig = reasoningConfig
+        self.eagerlyEvaluateWeights = eagerlyEvaluateWeights
     }
 
     /// Maps this configuration's behavioral properties into a
@@ -178,7 +188,8 @@ public struct ModelConfiguration: Sendable {
             stopStrings: stopStrings,
             eosTokenIds: eosTokenIds,
             toolCallFormat: toolCallFormat,
-            reasoningConfig: reasoningConfig)
+            reasoningConfig: reasoningConfig,
+            eagerlyEvaluateWeights: eagerlyEvaluateWeights)
     }
 
 }

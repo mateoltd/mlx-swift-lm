@@ -634,7 +634,8 @@ public final class LLMModelFactory: GenericModelFactory {
 
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+            perLayerQuantization: baseConfig.perLayerQuantization,
+            evaluate: configuration.eagerlyEvaluateWeights)
 
         let tokenizer = try await tokenizerTask
 

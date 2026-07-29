@@ -951,14 +951,12 @@ public class Qwen35TextModelInner: Module {
         let totalBatchSize = gathered.dim(0)
         let finalHidden = gathered[(totalBatchSize - batchSize) ..< totalBatchSize]
 
-        if inputs.dim(1) > 1 {
-            for layerIndex in localRange {
-                guard var layerCache = cacheArray?[layerIndex] else { continue }
-                layerCache.state = depends(
-                    inputs: layerCache.state,
-                    dependencies: [finalHidden]
-                )
-            }
+        if inputs.dim(1) > 1,
+           var terminalCache = cacheArray?[pipeline.endLayer - 1] {
+            terminalCache.state = depends(
+                inputs: terminalCache.state,
+                dependencies: Array(gathered[(totalBatchSize - batchSize) ..< totalBatchSize])
+            )
         }
 
         return norm(finalHidden)

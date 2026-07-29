@@ -903,7 +903,7 @@ public class Qwen35TextModelInner: Module {
                 pipeline.group.recvLike(
                     MLXArray.zeros(
                         [inputs.dim(0), inputs.dim(1), hiddenSize],
-                        dtype: embedTokens.weight.dtype
+                        dtype: norm.weight.dtype
                     ),
                     source: Int32(pipeline.rank - 1)
                 )

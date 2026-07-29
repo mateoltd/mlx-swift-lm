@@ -872,6 +872,34 @@ public final class ChatSession {
         await cache.read { _ in }
     }
 
+    /// Inspect the realized generation cache without copying its tensors.
+    ///
+    /// Pipeline-sharded models can contain placeholder caches for layers owned
+    /// by another rank. Those caches remain at offset zero, so callers should
+    /// use `maximumOffset` as the realized cached-prefix length and
+    /// `activeCacheCount` to verify that the expected local layers advanced.
+    public func cacheMetrics() async -> ChatSessionCacheMetrics {
+        await cache.read { cache in
+            switch cache {
+            case .empty:
+                ChatSessionCacheMetrics(
+                    state: .empty,
+                    offsets: []
+                )
+            case .history:
+                ChatSessionCacheMetrics(
+                    state: .history,
+                    offsets: []
+                )
+            case .kvcache(let caches, _, _):
+                ChatSessionCacheMetrics(
+                    state: .realized,
+                    offsets: caches.map(\.offset)
+                )
+            }
+        }
+    }
+
     /// Visit the current cache value, if realized as a `[KVCache]`.
     ///
     /// This method is meant for test support.
@@ -905,6 +933,35 @@ public final class ChatSession {
                 throw ChatSessionError.noCacheAvailable
             }
         }
+    }
+}
+
+/// Lightweight, tensor-free telemetry for a ``ChatSession`` cache.
+public struct ChatSessionCacheMetrics: Codable, Sendable {
+    public enum State: String, Codable, Sendable {
+        case empty
+        case history
+        case realized
+    }
+
+    public let state: State
+    public let offsets: [Int]
+
+    public var maximumOffset: Int {
+        offsets.max() ?? 0
+    }
+
+    public var minimumActiveOffset: Int {
+        offsets.filter { $0 > 0 }.min() ?? 0
+    }
+
+    public var activeCacheCount: Int {
+        offsets.lazy.filter { $0 > 0 }.count
+    }
+
+    public init(state: State, offsets: [Int]) {
+        self.state = state
+        self.offsets = offsets
     }
 }
 

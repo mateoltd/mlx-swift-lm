@@ -57,6 +57,9 @@ public struct GenerateParameters: Sendable {
     /// chunk (the Gemma 3 text path uses a smaller chunk than the generic 512 default).
     public var prefillStepSize: Int?
 
+    /// Hard limit for cached context plus new prompt tokens.
+    public var maxContextTokens: Int?
+
     /// Maximum tokens to generate
     public var maxTokens: Int?
 
@@ -130,6 +133,7 @@ public struct GenerateParameters: Sendable {
 
     public init(
         maxTokens: Int? = nil,
+        maxContextTokens: Int? = nil,
         maxKVSize: Int? = nil,
         kvBits: Int? = nil,
         kvGroupSize: Int = 64,
@@ -149,6 +153,7 @@ public struct GenerateParameters: Sendable {
         seed: UInt64? = nil
     ) {
         self.maxTokens = maxTokens
+        self.maxContextTokens = maxContextTokens
         self.maxKVSize = maxKVSize
         self.kvBits = kvBits
         self.kvGroupSize = kvGroupSize
@@ -609,6 +614,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.model = model
         self.y = .init(tokens: prompt)
         self.cache = cache ?? model.newCache(parameters: parameters)
+        try Self.checkContextLimit(
+            promptTokens: prompt.size,
+            cache: self.cache,
+            limit: parameters.maxContextTokens
+        )
 
         self.processor = parameters.processor()
         self.sampler = parameters.sampler()
@@ -647,6 +657,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.state = state
         self.y = input.text
         self.cache = cache ?? model.newCache(parameters: parameters)
+        try Self.checkContextLimit(
+            promptTokens: input.text.tokens.size,
+            cache: self.cache,
+            limit: parameters.maxContextTokens
+        )
 
         self.processor = parameters.processor()
         self.sampler = parameters.sampler()
@@ -735,6 +750,19 @@ public struct TokenIterator: TokenIteratorProtocol {
         return y
     }
 
+    private static func checkContextLimit(
+        promptTokens: Int,
+        cache: [KVCache],
+        limit: Int?
+    ) throws {
+        guard let limit else { return }
+        let cachedTokens = cache.map(\.offset).max() ?? 0
+        let requestedTokens = cachedTokens + promptTokens
+        guard requestedTokens <= limit else {
+            throw ContextLimitError(requestedTokens: requestedTokens, limit: limit)
+        }
+    }
+
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
         let result = withPreparedCache(cache, lengths: previous.sequenceLengths) {
@@ -788,6 +816,15 @@ public struct TokenIterator: TokenIteratorProtocol {
 
             return previousY.tokens.item(Int.self)
         }
+    }
+}
+
+public struct ContextLimitError: LocalizedError, Sendable {
+    public let requestedTokens: Int
+    public let limit: Int
+
+    public var errorDescription: String? {
+        "Context requires \(requestedTokens) tokens, exceeding the configured \(limit)-token safety limit."
     }
 }
 

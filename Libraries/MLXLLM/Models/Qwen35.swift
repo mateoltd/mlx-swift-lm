@@ -795,6 +795,15 @@ public class Qwen35TextModelInner: Module {
 
     let ssmIdx: Int
     let faIdx: Int
+    private var pipeline: PipelineConfiguration?
+
+    private struct PipelineConfiguration {
+        let startLayer: Int
+        let endLayer: Int
+        let rank: Int
+        let worldSize: Int
+        let group: DistributedGroup
+    }
 
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -822,6 +831,10 @@ public class Qwen35TextModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+        if let pipeline {
+            return pipelineForward(inputs, cache: cache, pipeline: pipeline)
+        }
+
         if inputs.dim(1) == 1, let caches = cache, let step = decodeStep(inputs, caches) {
             return step
         }
@@ -846,6 +859,100 @@ public class Qwen35TextModelInner: Module {
         }
 
         return norm(hiddenStates)
+    }
+
+    fileprivate func configurePipeline(
+        startLayer: Int,
+        endLayer: Int,
+        rank: Int,
+        worldSize: Int,
+        group: DistributedGroup
+    ) {
+        precondition(worldSize > 1, "Pipeline parallelism requires at least two ranks")
+        precondition(rank >= 0 && rank < worldSize, "Pipeline rank is out of range")
+        precondition(
+            startLayer >= 0 && startLayer < endLayer && endLayer <= layers.count,
+            "Pipeline layer range is invalid"
+        )
+        precondition(Int(group.rank) == rank, "Pipeline rank does not match MLX group rank")
+        precondition(
+            Int(group.size) == worldSize,
+            "Pipeline world size does not match MLX group size"
+        )
+
+        pipeline = PipelineConfiguration(
+            startLayer: startLayer,
+            endLayer: endLayer,
+            rank: rank,
+            worldSize: worldSize,
+            group: group
+        )
+    }
+
+    private func pipelineForward(
+        _ inputs: MLXArray,
+        cache: [KVCache?]?,
+        pipeline: PipelineConfiguration
+    ) -> MLXArray {
+        var hiddenStates = embedTokens(inputs)
+        if pipeline.rank != 0 {
+            hiddenStates = pipeline.group.recvLike(
+                hiddenStates, source: Int32(pipeline.rank - 1))
+        }
+
+        var cacheArray = cache
+        if cacheArray == nil {
+            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+
+        let localRange = pipeline.startLayer ..< pipeline.endLayer
+        let localSSMIndex = localRange.first { layers[$0].isLinear }
+        let localFAIndex = localRange.first { !layers[$0].isLinear }
+        let faMask: MLXFast.ScaledDotProductAttentionMaskMode =
+            if let localFAIndex {
+                createAttentionMask(h: hiddenStates, cache: cacheArray?[localFAIndex])
+            } else {
+                .none
+            }
+        let ssmMask: MLXArray? =
+            if let localSSMIndex {
+                createSSMMask(
+                    h: hiddenStates, cache: cacheArray?[localSSMIndex] as? MambaCache)
+            } else {
+                nil
+            }
+
+        for layerIndex in localRange {
+            let layer = layers[layerIndex]
+            hiddenStates = layer(
+                hiddenStates,
+                attentionMask: layer.isLinear ? .none : faMask,
+                ssmMask: layer.isLinear ? ssmMask : nil,
+                cache: cacheArray?[layerIndex]
+            )
+        }
+
+        if pipeline.rank != pipeline.worldSize - 1 {
+            hiddenStates = pipeline.group.send(
+                hiddenStates, dest: Int32(pipeline.rank + 1))
+        }
+
+        let gathered = pipeline.group.allGather(hiddenStates)
+        let batchSize = hiddenStates.dim(0)
+        let totalBatchSize = gathered.dim(0)
+        let finalHidden = gathered[(totalBatchSize - batchSize) ..< totalBatchSize]
+
+        if inputs.dim(1) > 1 {
+            for layerIndex in localRange {
+                guard var layerCache = cacheArray?[layerIndex] else { continue }
+                layerCache.state = depends(
+                    inputs: layerCache.state,
+                    dependencies: [finalHidden]
+                )
+            }
+        }
+
+        return norm(finalHidden)
     }
 
     // MARK: - Whole-step decode schedule
@@ -1027,6 +1134,22 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
+    public func configurePipeline(
+        startLayer: Int,
+        endLayer: Int,
+        rank: Int,
+        worldSize: Int,
+        group: DistributedGroup
+    ) {
+        model.configurePipeline(
+            startLayer: startLayer,
+            endLayer: endLayer,
+            rank: rank,
+            worldSize: worldSize,
+            group: group
+        )
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
             if layer.isLinear {
@@ -1098,6 +1221,22 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    public func configurePipeline(
+        startLayer: Int,
+        endLayer: Int,
+        rank: Int,
+        worldSize: Int,
+        group: DistributedGroup
+    ) {
+        languageModel.configurePipeline(
+            startLayer: startLayer,
+            endLayer: endLayer,
+            rank: rank,
+            worldSize: worldSize,
+            group: group
+        )
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {

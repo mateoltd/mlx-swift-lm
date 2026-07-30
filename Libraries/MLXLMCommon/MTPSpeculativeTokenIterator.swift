@@ -226,13 +226,13 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             throw KVCacheError(message: "MTP target-history prefill requires a non-empty prompt.")
         }
 
-        let stepSize = max(1, windowSize ?? 512)
+        let stepSize = Swift.max(1, windowSize ?? 512)
         var processed = 0
         var finalResult: LMOutput?
 
         while processed < tokens.size {
             try Task.checkCancellation()
-            let count = min(stepSize, tokens.size - processed)
+            let count = Swift.min(stepSize, tokens.size - processed)
             let chunk = tokens[processed ..< (processed + count)]
             var captureState = LMOutput.State()
             captureState[mtpEmitFlagKey] = true

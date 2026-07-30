@@ -923,6 +923,13 @@ public class Qwen35TextModelInner: Module {
         layers = Array(layers[startLayer ..< endLayer])
     }
 
+    fileprivate var pipelineTransport:
+        (rank: Int, worldSize: Int, group: DistributedGroup)?
+    {
+        guard let pipeline else { return nil }
+        return (pipeline.rank, pipeline.worldSize, pipeline.group)
+    }
+
     private func pipelineForward(
         _ inputs: MLXArray,
         cache: [KVCache?]?,
@@ -1269,6 +1276,48 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = model(inputs, cache: cache)
+
+        if let pipeline = model.pipelineTransport, pipeline.worldSize == 2 {
+            // Only the final token's logits participate in autoregressive
+            // sampling. Compute them once on the terminal stage and send the
+            // exact bytes to rank 0. Even greedy sampling can eventually
+            // diverge when norm/head reductions run independently on two
+            // GPUs; one different token is enough to desynchronize subsequent
+            // pipeline shapes and deadlock transport.
+            let lastToken = out[
+                0..., (out.dim(1) - 1) ..< out.dim(1), 0...
+            ]
+            if pipeline.rank == pipeline.worldSize - 1 {
+                if let lmHead {
+                    out = lmHead(lastToken)
+                } else {
+                    out = model.embedTokens.asLinear(lastToken)
+                }
+                qwenPipelineTrace(rank: pipeline.rank, "logits send scheduled")
+                out = pipeline.group.send(out, dest: 0, stream: .cpu)
+                if qwenPipelineWatchdogSafe {
+                    out.eval()
+                    qwenPipelineTrace(rank: pipeline.rank, "logits send completed")
+                }
+                return out
+            }
+
+            qwenPipelineTrace(rank: pipeline.rank, "logits receive scheduled")
+            out = pipeline.group.recvLike(
+                MLXArray.zeros(
+                    [out.dim(0), 1, vocabularySize],
+                    dtype: out.dtype
+                ),
+                source: Int32(pipeline.worldSize - 1),
+                stream: .cpu
+            )
+            if qwenPipelineWatchdogSafe {
+                out.eval()
+                qwenPipelineTrace(rank: pipeline.rank, "logits receive completed")
+            }
+            return out
+        }
+
         if let lmHead {
             out = lmHead(out)
         } else {

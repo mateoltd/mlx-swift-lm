@@ -18,6 +18,9 @@ private let qwenPipelineTraceEnabled =
 private let qwenPipelineWatchdogSafe =
     ProcessInfo.processInfo.environment["INFER_RING_PIPELINE_WATCHDOG_SAFE"] == "1"
 
+private let qwenPipelineBarrierEnabled =
+    ProcessInfo.processInfo.environment["INFER_RING_PIPELINE_BARRIER"] == "1"
+
 private let qwenPipelineEvalInterval = max(
     0,
     Int(ProcessInfo.processInfo.environment["INFER_RING_PIPELINE_EVAL_INTERVAL"] ?? "0")
@@ -1026,10 +1029,14 @@ public class Qwen35TextModelInner: Module {
             }
         }
 
-        if qwenPipelineWatchdogSafe {
+        if qwenPipelineWatchdogSafe && qwenPipelineBarrierEnabled {
             // Ensure every rank has finished its local stage before any rank
             // enters all-gather. This prevents an idle rank from holding a
             // Metal command buffer open while waiting for a slower stage.
+            // This is opt-in because repeated point-to-point transfers plus
+            // an extra ring collective can eventually reorder on the socket
+            // backend. The realized receive above and evaluated all-gather
+            // are sufficient for the two-rank pipeline by default.
             qwenPipelineTrace(rank: pipeline.rank, "barrier scheduled")
             let barrier = pipeline.group.allSum(
                 MLXArray(1, dtype: .int32),

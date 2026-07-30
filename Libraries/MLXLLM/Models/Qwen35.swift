@@ -1046,20 +1046,52 @@ public class Qwen35TextModelInner: Module {
             qwenPipelineTrace(rank: pipeline.rank, "barrier completed")
         }
 
-        let gathered = pipeline.group.allGather(hiddenStates, stream: .cpu)
-        if qwenPipelineWatchdogSafe {
-            gathered.eval()
-            qwenPipelineTrace(rank: pipeline.rank, "all-gather completed")
+        let finalHidden: MLXArray
+        if pipeline.worldSize == 2 {
+            // A two-stage pipeline does not need a collective here. Mixing
+            // point-to-point activation traffic with `allGather` on MLX's
+            // socket ring can eventually reorder operations and deadlock.
+            // Use a strict request/response handshake instead:
+            // rank 0 -> rank 1 activation, rank 1 -> rank 0 final hidden.
+            if pipeline.rank == pipeline.worldSize - 1 {
+                qwenPipelineTrace(rank: pipeline.rank, "return send scheduled")
+                finalHidden = pipeline.group.send(
+                    hiddenStates,
+                    dest: 0,
+                    stream: .cpu
+                )
+                if qwenPipelineWatchdogSafe {
+                    finalHidden.eval()
+                    qwenPipelineTrace(rank: pipeline.rank, "return send completed")
+                }
+            } else {
+                qwenPipelineTrace(rank: pipeline.rank, "return receive scheduled")
+                finalHidden = pipeline.group.recvLike(
+                    hiddenStates,
+                    source: Int32(pipeline.worldSize - 1),
+                    stream: .cpu
+                )
+                if qwenPipelineWatchdogSafe {
+                    finalHidden.eval()
+                    qwenPipelineTrace(rank: pipeline.rank, "return receive completed")
+                }
+            }
+        } else {
+            let gathered = pipeline.group.allGather(hiddenStates, stream: .cpu)
+            if qwenPipelineWatchdogSafe {
+                gathered.eval()
+                qwenPipelineTrace(rank: pipeline.rank, "all-gather completed")
+            }
+            let batchSize = hiddenStates.dim(0)
+            let totalBatchSize = gathered.dim(0)
+            finalHidden = gathered[(totalBatchSize - batchSize) ..< totalBatchSize]
         }
-        let batchSize = hiddenStates.dim(0)
-        let totalBatchSize = gathered.dim(0)
-        let finalHidden = gathered[(totalBatchSize - batchSize) ..< totalBatchSize]
 
         if inputs.dim(1) > 1,
            var terminalCache = cacheArray?[pipeline.endLayer - 1] {
             terminalCache.state = depends(
                 inputs: terminalCache.state,
-                dependencies: Array(gathered[(totalBatchSize - batchSize) ..< totalBatchSize])
+                dependencies: Array(finalHidden)
             )
         }
 

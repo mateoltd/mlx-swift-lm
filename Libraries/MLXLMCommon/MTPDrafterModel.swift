@@ -23,9 +23,21 @@ import MLXNN
 /// `draftBlock(...)` as a method parameter. This makes drafter instances safe
 /// to share across iterators without per-iterator mutable state.
 public protocol MTPDrafterModel: BaseLanguageModel {
+    /// Whether the drafter needs target hidden states for the prompt to build
+    /// its own committed attention history.
+    var requiresTargetHistoryPrefill: Bool { get }
+
     /// Reset stream-local drafter state before a new iterator is prepared.
     /// Stateless drafters use the default no-op implementation.
     func reset(target: any LanguageModel)
+
+    /// Consume one contiguous prompt chunk and its exact target hiddens.
+    func prefillTargetHistory(
+        target: any LanguageModel,
+        tokens: MLXArray,
+        targetHidden: MLXArray,
+        startPosition: Int
+    )
 
     /// K-step drafting from a constant position.
     ///
@@ -76,7 +88,16 @@ public protocol MTPDrafterModel: BaseLanguageModel {
 }
 
 extension MTPDrafterModel {
+    public var requiresTargetHistoryPrefill: Bool { false }
+
     public func reset(target _: any LanguageModel) {}
+
+    public func prefillTargetHistory(
+        target _: any LanguageModel,
+        tokens _: MLXArray,
+        targetHidden _: MLXArray,
+        startPosition _: Int
+    ) {}
 
     public func acceptVerifiedTokens(
         target _: any LanguageModel,
@@ -159,6 +180,12 @@ public let mtpSharedKVStatesKey =
 /// ``mtpLastHiddenStatesKey`` and ``mtpSharedKVStatesKey``. An absent key
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
+
+/// Verification asks Qwen pipeline ranks to project every position in the
+/// proposed block. Prompt-history capture leaves this false so prefill still
+/// computes and transports only the final position's logits.
+public let mtpVerifyAllLogitsKey =
+    LMOutput.Key<Bool>("mtp.verifyAllLogits")
 
 // MARK: - Iterator stats surface
 

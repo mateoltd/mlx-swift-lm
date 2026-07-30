@@ -1275,7 +1275,12 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        forward(inputs, cache: cache, emitDrafterState: false).logits
+        forward(
+            inputs,
+            cache: cache,
+            emitDrafterState: false,
+            verifyAllPositions: false
+        ).logits
     }
 
     /// MTP-aware entry point. The normal autoregressive path still transfers
@@ -1287,14 +1292,16 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         forward(
             input.tokens,
             cache: cache,
-            emitDrafterState: state?[mtpEmitFlagKey] ?? false
+            emitDrafterState: state?[mtpEmitFlagKey] ?? false,
+            verifyAllPositions: state?[mtpVerifyAllLogitsKey] ?? false
         )
     }
 
     private func forward(
         _ inputs: MLXArray,
         cache: [KVCache]?,
-        emitDrafterState: Bool
+        emitDrafterState: Bool,
+        verifyAllPositions: Bool
     ) -> LMOutput {
         let hidden = model(inputs, cache: cache)
         var logitsInput = hidden
@@ -1303,7 +1310,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             // Ordinary decode needs only the final position. MTP verification
             // deliberately keeps the whole block so one distributed round can
             // validate several proposed tokens.
-            if !emitDrafterState {
+            if !verifyAllPositions {
                 logitsInput = hidden[
                     0..., (hidden.dim(1) - 1) ..< hidden.dim(1), 0...
                 ]

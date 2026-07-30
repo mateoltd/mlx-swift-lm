@@ -140,6 +140,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
+        if drafter.requiresTargetHistoryPrefill {
+            try prepareTargetHistory(input: input, windowSize: windowSize)
+            return
+        }
+
         var prefillState = LMOutput.State()
         prefillState[mtpEmitFlagKey] = true
         // Note: the drafter is primed via an explicit follow-up forward call
@@ -206,6 +211,67 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 pendingTokens.append(token.item(Int.self))
             }
         }
+    }
+
+    /// Prefill a stateful drafter alongside the target without materializing
+    /// all prompt hiddens at once. Qwen sends only the last-position logits
+    /// for each chunk; the comparatively small hidden block stays on rank 0
+    /// long enough for the sidecar to extend its committed history.
+    private mutating func prepareTargetHistory(
+        input: LMInput,
+        windowSize: Int?
+    ) throws {
+        let tokens = input.text.tokens
+        guard tokens.size > 0 else {
+            throw KVCacheError(message: "MTP target-history prefill requires a non-empty prompt.")
+        }
+
+        let stepSize = max(1, windowSize ?? 512)
+        var processed = 0
+        var finalResult: LMOutput?
+
+        while processed < tokens.size {
+            try Task.checkCancellation()
+            let count = min(stepSize, tokens.size - processed)
+            let chunk = tokens[processed ..< (processed + count)]
+            var captureState = LMOutput.State()
+            captureState[mtpEmitFlagKey] = true
+            captureState[mtpVerifyAllLogitsKey] = false
+
+            let result = mainModel(
+                LMInput.Text(tokens: chunk)[text: .newAxis],
+                cache: mainCache,
+                state: captureState
+            )
+            guard let hidden = result.state?[mtpLastHiddenStatesKey] else {
+                throw KVCacheError(
+                    message: "Target did not emit hidden states required by the MTP drafter.")
+            }
+            drafter.prefillTargetHistory(
+                target: mainModel,
+                tokens: chunk,
+                targetHidden: hidden,
+                startPosition: processed
+            )
+
+            // Bound the lazy graph to one prompt chunk on both ranks.
+            eval(mainCache.flatMap(\.state))
+            processed += count
+            finalResult = result
+        }
+
+        guard let finalResult else {
+            throw KVCacheError(message: "MTP target-history prefill produced no target output.")
+        }
+        var logits = finalResult.logits[0..., -1, 0...]
+        logits = processor?.process(logits: logits) ?? logits
+        let bonus = sampler.sample(logits: logits)
+        processor?.didSample(token: bonus)
+        eval(bonus)
+
+        y = .init(tokens: bonus)
+        mainState = finalResult.state
+        pendingTokens.append(bonus.item(Int.self))
     }
 
     /// Single round: draft `blockSize - 1` tokens, verify with main, accept
@@ -284,6 +350,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // in one forward call, emitting state for next round.
         var verifyState = LMOutput.State()
         verifyState[mtpEmitFlagKey] = true
+        verifyState[mtpVerifyAllLogitsKey] = true
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
@@ -405,6 +472,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             let committedTokens = verifyTokens[..<committedCount]
             var replayState = LMOutput.State()
             replayState[mtpEmitFlagKey] = true
+            replayState[mtpVerifyAllLogitsKey] = false
             let replay = mainModel(
                 LMInput.Text(tokens: committedTokens)[text: .newAxis],
                 cache: mainCache,

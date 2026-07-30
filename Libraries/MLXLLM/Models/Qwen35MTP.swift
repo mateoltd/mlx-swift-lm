@@ -66,7 +66,10 @@ public final class Qwen35MTPDraftModel: Module, MTPDrafterModel {
     private var cache: [KVCache] = []
     private var seedToken: MLXArray?
     private var seedHidden: MLXArray?
+    private var prefillCarryHidden: MLXArray?
     private var roundAppended = 0
+
+    public var requiresTargetHistoryPrefill: Bool { true }
 
     public init(_ configuration: Qwen35MTPConfiguration) {
         self.configuration = configuration
@@ -92,6 +95,7 @@ public final class Qwen35MTPDraftModel: Module, MTPDrafterModel {
         cache.removeAll(keepingCapacity: false)
         seedToken = nil
         seedHidden = nil
+        prefillCarryHidden = nil
         roundAppended = 0
     }
 
@@ -124,7 +128,7 @@ public final class Qwen35MTPDraftModel: Module, MTPDrafterModel {
         return target.model.embedTokens.asLinear(hidden)
     }
 
-    private func forwardToken(
+    private func forwardTokens(
         _ token: MLXArray,
         hidden: MLXArray,
         target: any LanguageModel
@@ -151,6 +155,49 @@ public final class Qwen35MTPDraftModel: Module, MTPDrafterModel {
             )
         }
         return norm(h)
+    }
+
+    public func prefillTargetHistory(
+        target: any LanguageModel,
+        tokens: MLXArray,
+        targetHidden: MLXArray,
+        startPosition: Int
+    ) {
+        if cache.isEmpty {
+            cache = (0 ..< layers.count).map { _ in
+                PositionedKVCache(basePosition: 0)
+            }
+        }
+
+        let count = tokens.size
+        guard count > 0 else { return }
+
+        let pairedTokens: MLXArray
+        let pairedHidden: MLXArray
+        if startPosition == 0 {
+            guard count > 1 else {
+                prefillCarryHidden = targetHidden[0..., (-1)..., 0...]
+                eval(prefillCarryHidden!)
+                return
+            }
+            pairedTokens = tokens[1...][.newAxis]
+            pairedHidden = targetHidden[0..., ..<(count - 1), 0...]
+        } else {
+            guard let carry = prefillCarryHidden else {
+                preconditionFailure("Qwen MTP prompt chunks must be contiguous")
+            }
+            pairedTokens = tokens[.newAxis]
+            let within =
+                count > 1
+                ? targetHidden[0..., ..<(count - 1), 0...]
+                : targetHidden[0..., ..<0, 0...]
+            pairedHidden = concatenated([carry, within], axis: 1)
+        }
+
+        _ = forwardTokens(pairedTokens, hidden: pairedHidden, target: target)
+        eval(cache.flatMap(\.state))
+        prefillCarryHidden = targetHidden[0..., (-1)..., 0...]
+        eval(prefillCarryHidden!)
     }
 
     private func sampledToken(
@@ -191,7 +238,7 @@ public final class Qwen35MTPDraftModel: Module, MTPDrafterModel {
         }
 
         while proposed.count < blockSize - 1 {
-            hidden = forwardToken(token, hidden: hidden, target: target)
+            hidden = forwardTokens(token, hidden: hidden, target: target)
             roundAppended += 1
             token = sampledToken(hidden, target: target, sampler: sampler)
             proposed.append(token)
@@ -230,7 +277,7 @@ public final class Qwen35MTPDraftModel: Module, MTPDrafterModel {
         let slot = min(max(0, accepted), verifyHidden.dim(1) - 1)
         let committedHidden = verifyHidden[0..., slot ..< (slot + 1), 0...]
         let committedToken = bonusToken[.newAxis]
-        let nextHidden = forwardToken(
+        let nextHidden = forwardTokens(
             committedToken, hidden: committedHidden, target: target)
         seedHidden = nextHidden
         seedToken = sampledToken(nextHidden, target: target, sampler: sampler)
@@ -256,6 +303,8 @@ public final class Qwen35MTPDraftModel: Module, MTPDrafterModel {
 /// proposal block once; the iPhone receives exactly those tokens before
 /// entering the same target-verification collective sequence.
 public final class Qwen35MTPFollowerModel: Module, MTPDrafterModel {
+    public var requiresTargetHistoryPrefill: Bool { true }
+
     public override init() {
         super.init()
     }

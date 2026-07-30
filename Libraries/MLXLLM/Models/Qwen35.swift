@@ -1000,8 +1000,7 @@ public class Qwen35TextModelInner: Module {
                 cache: cacheArray?[layerIndex]
             )
             let completedLocalLayers = layerIndex - pipeline.startLayer + 1
-            if inputs.dim(1) > 1
-                && qwenPipelineEvalInterval > 0
+            if qwenPipelineEvalInterval > 0
                 && (completedLocalLayers.isMultiple(of: qwenPipelineEvalInterval)
                     || layerIndex == pipeline.endLayer - 1)
             {

@@ -809,7 +809,8 @@ final class Qwen35DecoderLayer: Module {
 public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen35DecoderLayer]
+    fileprivate var layers: [Qwen35DecoderLayer]
+    fileprivate let layerIsLinear: [Bool]
     let norm: RMSNorm
 
     let ssmIdx: Int
@@ -837,6 +838,7 @@ public class Qwen35TextModelInner: Module {
             Qwen35DecoderLayer(args, layerIdx: layerIdx)
         }
         self.layers = layers
+        self.layerIsLinear = layers.map(\.isLinear)
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
@@ -892,9 +894,10 @@ public class Qwen35TextModelInner: Module {
         precondition(worldSize > 1, "Pipeline parallelism requires at least two ranks")
         precondition(rank >= 0 && rank < worldSize, "Pipeline rank is out of range")
         precondition(
-            startLayer >= 0 && startLayer < endLayer && endLayer <= layers.count,
+            startLayer >= 0 && startLayer < endLayer && endLayer <= layerIsLinear.count,
             "Pipeline layer range is invalid"
         )
+        precondition(pipeline == nil, "Pipeline model is already configured")
         precondition(Int(group.rank) == rank, "Pipeline rank does not match MLX group rank")
         precondition(
             Int(group.size) == worldSize,
@@ -908,6 +911,13 @@ public class Qwen35TextModelInner: Module {
             worldSize: worldSize,
             group: group
         )
+
+        // Release every transformer block not owned by this rank. The model
+        // factory deliberately leaves distributed weights lazy, so slicing
+        // before Infer Ring evaluates the module prevents non-local weights
+        // from becoming resident and makes pipeline sharding increase actual
+        // memory capacity instead of only dividing computation.
+        layers = Array(layers[startLayer ..< endLayer])
     }
 
     private func pipelineForward(
@@ -938,12 +948,15 @@ public class Qwen35TextModelInner: Module {
 
         var cacheArray = cache
         if cacheArray == nil {
-            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+            cacheArray = Array(repeating: nil as KVCache?, count: layerIsLinear.count)
         }
 
-        let localRange = pipeline.startLayer ..< pipeline.endLayer
-        let localSSMIndex = localRange.first { layers[$0].isLinear }
-        let localFAIndex = localRange.first { !layers[$0].isLinear }
+        let localSSMIndex = layers.firstIndex(where: \.isLinear).map {
+            pipeline.startLayer + $0
+        }
+        let localFAIndex = layers.firstIndex(where: { !$0.isLinear }).map {
+            pipeline.startLayer + $0
+        }
         let faMask: MLXFast.ScaledDotProductAttentionMaskMode =
             if let localFAIndex {
                 createAttentionMask(h: hiddenStates, cache: cacheArray?[localFAIndex])
@@ -958,8 +971,8 @@ public class Qwen35TextModelInner: Module {
                 nil
             }
 
-        for layerIndex in localRange {
-            let layer = layers[layerIndex]
+        for (localLayerIndex, layer) in layers.enumerated() {
+            let layerIndex = pipeline.startLayer + localLayerIndex
             hiddenStates = layer(
                 hiddenStates,
                 attentionMask: layer.isLinear ? .none : faMask,
@@ -1232,8 +1245,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        return model.layers.map { layer in
-            if layer.isLinear {
+        return model.layerIsLinear.map { isLinear in
+            if isLinear {
                 return MambaCache()
             }
             return KVCacheSimple()

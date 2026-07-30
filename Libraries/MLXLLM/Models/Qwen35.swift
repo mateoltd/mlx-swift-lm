@@ -945,6 +945,16 @@ public class Qwen35TextModelInner: Module {
             rank: pipeline.rank,
             pipeline.rank == 0 ? "embedding scheduled" : "receive scheduled"
         )
+        if pipeline.rank != 0 && qwenPipelineWatchdogSafe {
+            // `recvLike(..., stream: .cpu)` is lazy. If the first consumer is
+            // a Metal layer, MLX can submit a GPU command buffer that waits on
+            // the CPU transport. A large activation may then spend the whole
+            // iOS watchdog window waiting rather than computing. Realize the
+            // received activation on the CPU stream before scheduling any
+            // local Metal work.
+            hiddenStates.eval()
+            qwenPipelineTrace(rank: pipeline.rank, "receive completed")
+        }
 
         var cacheArray = cache
         if cacheArray == nil {

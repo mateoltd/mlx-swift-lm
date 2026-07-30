@@ -112,16 +112,14 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         self.drafter = drafter
 
         self.mainCache = mainCache ?? mainModel.newCache(parameters: parameters)
-        guard canTrimPromptCache(self.mainCache) else {
-            throw KVCacheError(
-                message: "MTP speculative decoding requires a trimmable main KV cache.")
-        }
 
         self.sampler = parameters.sampler()
         self.processor = parameters.processor()
 
         self.maxTokens = parameters.maxTokens
         self.blockSize = blockSize
+
+        drafter.reset(target: mainModel)
 
         self.quantizeKVCache = { cache in
             maybeQuantizeKVCache(
@@ -289,6 +287,25 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
+
+        // Hybrid targets such as Qwen3.6 contain recurrent DeltaNet state
+        // that cannot be trimmed by token count. Snapshot before verification
+        // and replay only the committed prefix after a rejection. Attention-
+        // only targets retain the cheaper trim-in-place path.
+        let requiresSnapshotRollback = !canTrimPromptCache(mainCache)
+        let cacheSnapshot: [KVCache]? =
+            if requiresSnapshotRollback {
+                mainCache.map { $0.copy() }
+            } else {
+                nil
+            }
+        if let cacheSnapshot {
+            // Force the snapshot before the verifier mutates live cache
+            // objects; otherwise lazy array views could capture post-verify
+            // state and make rollback nondeterministic.
+            eval(cacheSnapshot.flatMap(\.state))
+        }
+
         let mainResult = mainModel(
             verifyInput[text: .newAxis], cache: mainCache, state: verifyState)
         let mainLogits = mainResult.logits
@@ -348,6 +365,17 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             draftModelCalls: 1
         )
 
+        if let verifyHidden = mainResult.state?[mtpLastHiddenStatesKey] {
+            drafter.acceptVerifiedTokens(
+                target: mainModel,
+                verifyHidden: verifyHidden,
+                draftTokens: draftTokens,
+                accepted: accepted,
+                bonusToken: finalToken,
+                sampler: sampler
+            )
+        }
+
         // Rewind the main cache and the emitted sharedKV snapshot by the
         // rejected count, in lockstep. The drafter has no cache of its own,
         // but the verify pass's state emission spans the full verify chunk —
@@ -357,8 +385,27 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // untrimmable (post-wrap sliding window), where trimPromptCache
         // no-ops and returns 0.
         let rejected = numDraft - accepted
-        let trimmed = trimPromptCache(mainCache, numTokens: rejected)
-        trimSharedKVState(&mainState, numTokens: trimmed)
+        if rejected > 0, let cacheSnapshot {
+            mainCache = cacheSnapshot
+
+            // Commit the always-consumed bonus plus the accepted draft
+            // prefix. This rebuilds both recurrent and attention state from
+            // the exact pre-verify checkpoint on every distributed rank.
+            let committedCount = accepted + 1
+            let committedTokens = verifyTokens[..<committedCount]
+            var replayState = LMOutput.State()
+            replayState[mtpEmitFlagKey] = true
+            let replay = mainModel(
+                LMInput.Text(tokens: committedTokens)[text: .newAxis],
+                cache: mainCache,
+                state: replayState
+            )
+            mainState = replay.state
+            eval(mainCache.flatMap(\.state))
+        } else {
+            let trimmed = trimPromptCache(mainCache, numTokens: rejected)
+            trimSharedKVState(&mainState, numTokens: trimmed)
+        }
 
         // Dynamic cache quantization may convert `.regular` K/V to `.quantized`,
         // at which point the target's emit-hook returns sharedKV: nil and the

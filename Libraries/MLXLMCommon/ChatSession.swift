@@ -677,7 +677,38 @@ public final class ChatSession {
                             )
                         }
 
-                        if let speculativeDecoding {
+                        if let mtpContainer =
+                            additionalContext?["mtpDrafter"] as? MTPDrafterContainer
+                        {
+                            let mtpModel = await mtpContainer.perform { context in
+                                SendableBox(context.model)
+                            }.consume()
+                            let requestedBlockSize =
+                                additionalContext?["mtpBlockSize"] as? Int ?? 3
+
+                            do {
+                                let iterator = try MTPSpeculativeTokenIterator(
+                                    input: input,
+                                    mainModel: model,
+                                    drafter: mtpModel,
+                                    mainCache: kvCache,
+                                    parameters: generateParameters,
+                                    blockSize: max(2, requestedBlockSize)
+                                )
+                                (genStream, genTask) = MLXLMCommon.generateTask(
+                                    promptTokenCount: input.text.tokens.size,
+                                    modelConfiguration: modelConfiguration,
+                                    tokenizer: tokenizer,
+                                    iterator: iterator,
+                                    tools: tools
+                                )
+                            } catch {
+                                print(
+                                    "[ChatSession] MTP initialization failed; "
+                                        + "using autoregressive decoding: \(error)")
+                                (genStream, genTask) = try defaultGeneration()
+                            }
+                        } else if let speculativeDecoding {
                             var shouldFallBackBeforeLoadingDraft = false
                             if let memoryPolicy = speculativeDecoding.memoryPolicy,
                                 let draftModelBytes =

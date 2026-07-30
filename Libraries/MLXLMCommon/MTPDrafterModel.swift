@@ -23,6 +23,10 @@ import MLXNN
 /// `draftBlock(...)` as a method parameter. This makes drafter instances safe
 /// to share across iterators without per-iterator mutable state.
 public protocol MTPDrafterModel: BaseLanguageModel {
+    /// Reset stream-local drafter state before a new iterator is prepared.
+    /// Stateless drafters use the default no-op implementation.
+    func reset(target: any LanguageModel)
+
     /// K-step drafting from a constant position.
     ///
     /// Returns the proposed tokens as a `[B, blockSize - 1]` MLXArray. The
@@ -57,6 +61,31 @@ public protocol MTPDrafterModel: BaseLanguageModel {
         blockSize: Int,
         sampler: any LogitSampler
     ) -> MLXArray
+
+    /// Commit verifier results into a stateful drafter's private history.
+    /// The default implementation is a no-op for drafters that borrow target
+    /// K/V and retain no round-local cache.
+    func acceptVerifiedTokens(
+        target: any LanguageModel,
+        verifyHidden: MLXArray,
+        draftTokens: MLXArray,
+        accepted: Int,
+        bonusToken: MLXArray,
+        sampler: any LogitSampler
+    )
+}
+
+extension MTPDrafterModel {
+    public func reset(target _: any LanguageModel) {}
+
+    public func acceptVerifiedTokens(
+        target _: any LanguageModel,
+        verifyHidden _: MLXArray,
+        draftTokens _: MLXArray,
+        accepted _: Int,
+        bonusToken _: MLXArray,
+        sampler _: any LogitSampler
+    ) {}
 }
 
 /// Lightweight context for an MTP drafter — simpler than `ModelContext`

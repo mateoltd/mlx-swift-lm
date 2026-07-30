@@ -923,7 +923,7 @@ public class Qwen35TextModelInner: Module {
         layers = Array(layers[startLayer ..< endLayer])
     }
 
-    fileprivate var pipelineTransport:
+    var pipelineTransport:
         (rank: Int, worldSize: Int, group: DistributedGroup)?
     {
         guard let pipeline else { return nil }
@@ -1275,55 +1275,105 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
+        forward(inputs, cache: cache, emitDrafterState: false).logits
+    }
+
+    /// MTP-aware entry point. The normal autoregressive path still transfers
+    /// only the final position's logits. An opted-in verifier pass transfers
+    /// every position and exposes the terminal hidden states to the drafter.
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        forward(
+            input.tokens,
+            cache: cache,
+            emitDrafterState: state?[mtpEmitFlagKey] ?? false
+        )
+    }
+
+    private func forward(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        emitDrafterState: Bool
+    ) -> LMOutput {
+        let hidden = model(inputs, cache: cache)
+        var logitsInput = hidden
 
         if let pipeline = model.pipelineTransport, pipeline.worldSize == 2 {
-            // Only the final token's logits participate in autoregressive
-            // sampling. Compute them once on the terminal stage and send the
-            // exact bytes to rank 0. Even greedy sampling can eventually
-            // diverge when norm/head reductions run independently on two
-            // GPUs; one different token is enough to desynchronize subsequent
-            // pipeline shapes and deadlock transport.
-            let lastToken = out[
-                0..., (out.dim(1) - 1) ..< out.dim(1), 0...
-            ]
+            // Ordinary decode needs only the final position. MTP verification
+            // deliberately keeps the whole block so one distributed round can
+            // validate several proposed tokens.
+            if !emitDrafterState {
+                logitsInput = hidden[
+                    0..., (hidden.dim(1) - 1) ..< hidden.dim(1), 0...
+                ]
+            }
             if pipeline.rank == pipeline.worldSize - 1 {
                 if let lmHead {
-                    out = lmHead(lastToken)
+                    logitsInput = lmHead(logitsInput)
                 } else {
-                    out = model.embedTokens.asLinear(lastToken)
+                    logitsInput = model.embedTokens.asLinear(logitsInput)
                 }
                 qwenPipelineTrace(rank: pipeline.rank, "logits send scheduled")
-                out = pipeline.group.send(out, dest: 0, stream: .cpu)
+                logitsInput = pipeline.group.send(logitsInput, dest: 0, stream: .cpu)
                 if qwenPipelineWatchdogSafe {
-                    out.eval()
+                    logitsInput.eval()
                     qwenPipelineTrace(rank: pipeline.rank, "logits send completed")
                 }
-                return out
+                return makeOutput(
+                    logits: logitsInput,
+                    hidden: hidden,
+                    emitDrafterState: emitDrafterState
+                )
             }
 
             qwenPipelineTrace(rank: pipeline.rank, "logits receive scheduled")
-            out = pipeline.group.recvLike(
+            logitsInput = pipeline.group.recvLike(
                 MLXArray.zeros(
-                    [out.dim(0), 1, vocabularySize],
-                    dtype: out.dtype
+                    [hidden.dim(0), logitsInput.dim(1), vocabularySize],
+                    dtype: hidden.dtype
                 ),
                 source: Int32(pipeline.worldSize - 1),
                 stream: .cpu
             )
             if qwenPipelineWatchdogSafe {
-                out.eval()
+                logitsInput.eval()
                 qwenPipelineTrace(rank: pipeline.rank, "logits receive completed")
             }
-            return out
+            return makeOutput(
+                logits: logitsInput,
+                hidden: hidden,
+                emitDrafterState: emitDrafterState
+            )
         }
 
         if let lmHead {
-            out = lmHead(out)
+            logitsInput = lmHead(logitsInput)
         } else {
-            out = model.embedTokens.asLinear(out)
+            logitsInput = model.embedTokens.asLinear(logitsInput)
         }
-        return out
+        return makeOutput(
+            logits: logitsInput,
+            hidden: hidden,
+            emitDrafterState: emitDrafterState
+        )
+    }
+
+    private func makeOutput(
+        logits: MLXArray,
+        hidden: MLXArray,
+        emitDrafterState: Bool
+    ) -> LMOutput {
+        guard emitDrafterState else {
+            return LMOutput(logits: logits)
+        }
+        var state = LMOutput.State()
+        state[mtpLastHiddenStatesKey] = hidden
+        // Qwen's MTP head owns its attention history and does not consume
+        // target shared K/V. A present empty dictionary satisfies the common
+        // MTP iterator contract without retaining redundant target tensors.
+        state[mtpSharedKVStatesKey] = [:]
+        return LMOutput(logits: logits, state: state)
     }
 
     public func configurePipeline(
@@ -1413,6 +1463,12 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        languageModel(input, cache: cache, state: state)
     }
 
     public func configurePipeline(

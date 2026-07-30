@@ -365,6 +365,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             draftModelCalls: 1
         )
 
+        // Low-acceptance speculation cannot amortize a target verification
+        // pass, especially across a device boundary. Use a conservative warm
+        // sample before making the fallback sticky; both ranks observe the
+        // same verified tokens and therefore make the same decision.
+        if proposedCount >= 24,
+            Double(acceptedCount) / Double(proposedCount) < 0.35
+        {
+            switchToPassthrough(reason: "draft acceptance remained below 35%")
+        }
+
         if let verifyHidden = mainResult.state?[mtpLastHiddenStatesKey] {
             drafter.acceptVerifiedTokens(
                 target: mainModel,
@@ -451,20 +461,20 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             return nil
         }
 
-        if passthrough {
-            if let token = passthroughStep() {
-                telemetry.recordGeneratedToken()
-                return token
-            }
-            return nil
-        }
-
         // Drain the pending buffer first.
         if pendingIndex < pendingTokens.count {
             let token = pendingTokens[pendingIndex]
             pendingIndex += 1
             telemetry.recordGeneratedToken()
             return token
+        }
+
+        if passthrough {
+            if let token = passthroughStep() {
+                telemetry.recordGeneratedToken()
+                return token
+            }
+            return nil
         }
 
         // Run a new speculation round (may transition to passthrough).

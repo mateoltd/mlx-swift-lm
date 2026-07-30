@@ -12,6 +12,25 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+private let qwenPipelineTraceEnabled =
+    ProcessInfo.processInfo.environment["INFER_RING_PIPELINE_TRACE"] == "1"
+
+private let qwenPipelineWatchdogSafe =
+    ProcessInfo.processInfo.environment["INFER_RING_PIPELINE_WATCHDOG_SAFE"] == "1"
+
+private let qwenPipelineEvalInterval = max(
+    0,
+    Int(ProcessInfo.processInfo.environment["INFER_RING_PIPELINE_EVAL_INTERVAL"] ?? "0")
+        ?? 0
+)
+
+private func qwenPipelineTrace(rank: Int, _ message: String) {
+    guard qwenPipelineTraceEnabled else { return }
+    let line = "[QWEN35-PIPELINE][rank=\(rank)] \(message)\n"
+    guard let data = line.data(using: .utf8) else { return }
+    FileHandle.standardError.write(data)
+}
+
 // MARK: - Fused router top-k
 
 /// One-kernel replacement for the decode router tail: `chainRouterTopK`
@@ -896,6 +915,10 @@ public class Qwen35TextModelInner: Module {
         cache: [KVCache?]?,
         pipeline: PipelineConfiguration
     ) -> MLXArray {
+        qwenPipelineTrace(
+            rank: pipeline.rank,
+            "begin tokens=\(inputs.dim(1)) layers=\(pipeline.startLayer)..<\(pipeline.endLayer)"
+        )
         var hiddenStates =
             if pipeline.rank == 0 {
                 embedTokens(inputs)
@@ -908,6 +931,10 @@ public class Qwen35TextModelInner: Module {
                     source: Int32(pipeline.rank - 1)
                 )
             }
+        qwenPipelineTrace(
+            rank: pipeline.rank,
+            pipeline.rank == 0 ? "embedding scheduled" : "receive scheduled"
+        )
 
         var cacheArray = cache
         if cacheArray == nil {
@@ -939,14 +966,60 @@ public class Qwen35TextModelInner: Module {
                 ssmMask: layer.isLinear ? ssmMask : nil,
                 cache: cacheArray?[layerIndex]
             )
+            let completedLocalLayers = layerIndex - pipeline.startLayer + 1
+            if qwenPipelineEvalInterval > 0
+                && (completedLocalLayers.isMultiple(of: qwenPipelineEvalInterval)
+                    || layerIndex == pipeline.endLayer - 1)
+            {
+                qwenPipelineTrace(
+                    rank: pipeline.rank,
+                    "evaluating through layer \(layerIndex)"
+                )
+                hiddenStates.eval()
+                qwenPipelineTrace(
+                    rank: pipeline.rank,
+                    "evaluated through layer \(layerIndex)"
+                )
+            }
         }
 
         if pipeline.rank != pipeline.worldSize - 1 {
+            if qwenPipelineWatchdogSafe {
+                // Finish local Metal work before CPU transport. Leaving the
+                // command buffer open while a remote rank catches up can trip
+                // Apple's non-configurable GPU watchdog.
+                hiddenStates.eval()
+            }
+            qwenPipelineTrace(rank: pipeline.rank, "send scheduled")
             hiddenStates = pipeline.group.send(
-                hiddenStates, dest: Int32(pipeline.rank + 1))
+                hiddenStates,
+                dest: Int32(pipeline.rank + 1),
+                stream: .cpu
+            )
+            if qwenPipelineWatchdogSafe {
+                hiddenStates.eval()
+                qwenPipelineTrace(rank: pipeline.rank, "send completed")
+            }
         }
 
-        let gathered = pipeline.group.allGather(hiddenStates)
+        if qwenPipelineWatchdogSafe {
+            // Ensure every rank has finished its local stage before any rank
+            // enters all-gather. This prevents an idle rank from holding a
+            // Metal command buffer open while waiting for a slower stage.
+            qwenPipelineTrace(rank: pipeline.rank, "barrier scheduled")
+            let barrier = pipeline.group.allSum(
+                MLXArray(1, dtype: .int32),
+                stream: .cpu
+            )
+            barrier.eval()
+            qwenPipelineTrace(rank: pipeline.rank, "barrier completed")
+        }
+
+        let gathered = pipeline.group.allGather(hiddenStates, stream: .cpu)
+        if qwenPipelineWatchdogSafe {
+            gathered.eval()
+            qwenPipelineTrace(rank: pipeline.rank, "all-gather completed")
+        }
         let batchSize = hiddenStates.dim(0)
         let totalBatchSize = gathered.dim(0)
         let finalHidden = gathered[(totalBatchSize - batchSize) ..< totalBatchSize]
